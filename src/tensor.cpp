@@ -1,156 +1,130 @@
 #include "tensor.h"
-#include <numeric>
-#include <cstring>
-#include <random>
-#include <iomanip>
-#include <cuda_runtime.h>
+#include <numeric>   // for std::accumulate
+#include <iostream>
+#include <iomanip>   // for std::setprecision
+#include <cstring>   // for std::memcpy
+#include <stdexcept> // for std::runtime_error
+#include <cuda_runtime.h> // CUDA Runtime API
 
-// 辅助宏：检查 CUDA 错误
-#define CHECK_CUDA(call) \
+// 修正 1: 宏定义改为接受两个参数 (call, msg)
+// 或者在宏内部忽略 msg，但为了保留错误信息，建议如下写法：
+#define CHECK_CUDA(call, msg) \
     do { \
         cudaError_t err = call; \
         if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error: %s at %s:%d\n", cudaGetErrorString(err), __FILE__, __LINE__); \
+            fprintf(stderr, "CUDA Error: %s (%s) at %s:%d\n", msg, cudaGetErrorString(err), __FILE__, __LINE__); \
             exit(EXIT_FAILURE); \
         } \
     } while (0)
 
-Tensor::Tensor(const std::vector<size_t>& shape, Device device, DType dtype)
-    : shape_(shape), device_(device), dtype_(dtype) {
+Tensor::Tensor(std::vector<size_t> shape, Device device) {
+    shape_ = shape;
     numel_ = std::accumulate(shape_.begin(), shape_.end(), 1, std::multiplies<size_t>());
-    allocate();
+    device_ = device;
+    allocate(); 
 }
 
 Tensor::~Tensor() {
     free();
 }
 
-Tensor::Tensor(Tensor&& other) noexcept 
-    : data_(other.data_), shape_(std::move(other.shape_)), numel_(other.numel_), device_(other.device_), dtype_(other.dtype_) {
+Tensor::Tensor(Tensor&& other) noexcept {
+    shape_ = std::move(other.shape_);
+    numel_ = other.numel_;
+    device_ = other.device_;
+    data_ = other.data_; 
+    
     other.data_ = nullptr;
     other.numel_ = 0;
 }
 
 Tensor& Tensor::operator=(Tensor&& other) noexcept {
     if (this != &other) {
-        free();
-        data_ = other.data_;
+        free(); 
+        
         shape_ = std::move(other.shape_);
         numel_ = other.numel_;
         device_ = other.device_;
-        dtype_ = other.dtype_;
+        data_ = other.data_;
         
         other.data_ = nullptr;
         other.numel_ = 0;
     }
-    return *this;
+    return *this; 
 }
 
-size_t Tensor::size_bytes() const {
-    size_t element_size = (dtype_ == DType::Float32) ? 4 : 2;
-    return numel_ * element_size;
-}
+// 修正 2: 变量名拼写 date -> data_, device -> device_, Cuda -> CUDA
+void Tensor::to(Device target_device){
+    if(target_device == device_){ // device_
+        return;
+    }
 
-void Tensor::allocate() {
-    if (numel_ == 0) return;
+    float* new_data = nullptr;
+    size_t bytes = numel_ * sizeof(float); // numel_
 
-    if (device_ == Device::CPU) {
-        data_ = malloc(size_bytes());
-        if (!data_) throw std::runtime_error("CPU memory allocation failed");
+    // 1. Allocate on target
+    if(target_device == Device::CPU){
+        new_data = new float[numel_];
     } else {
-        CHECK_CUDA(cudaMalloc(&data_, size_bytes()));
-    }
-}
-
-void Tensor::free() {
-    if (data_) {
-        if (device_ == Device::CPU) {
-            std::free(data_);
-        } else {
-            CHECK_CUDA(cudaFree(data_));
-        }
-        data_ = nullptr;
-    }
-}
-
-void Tensor::to(Device target_device) {
-    if (device_ == target_device) return;
-
-    void* new_data = nullptr;
-    size_t bytes = size_bytes();
-
-    // 分配新内存
-    if (target_device == Device::CPU) {
-        new_data = malloc(bytes);
-        if (!new_data) throw std::runtime_error("CPU allocation failed during transfer");
-        // Device -> Host
-        CHECK_CUDA(cudaMemcpy(new_data, data_, bytes, cudaMemcpyDeviceToHost));
-    } else {
-        CHECK_CUDA(cudaMalloc(&new_data, bytes));
-        // Host -> Device
-        CHECK_CUDA(cudaMemcpy(new_data, data_, bytes, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMalloc((void**)&new_data, bytes), "cudaMalloc failed");
     }
 
-    // 释放旧内存并更新
+    // 2. Copy
+    // 如果现在是在 GPU (device_ == CUDA)，且目标是 CPU
+    if(device_ == Device::CUDA && target_device == Device::CPU){
+        CHECK_CUDA(cudaMemcpy(new_data, data_, bytes, cudaMemcpyDeviceToHost), "D2H failed");
+    } 
+    // 如果现在是在 CPU，且目标是 GPU
+    else if (device_ == Device::CPU && target_device == Device::CUDA) {
+        CHECK_CUDA(cudaMemcpy(new_data, data_, bytes, cudaMemcpyHostToDevice), "H2D failed");
+    }
+    // (可选) GPU 到 GPU 的拷贝通常用 cudaMemcpyDeviceToDevice，暂时不处理
+
+    // 3. Free old & Update
     free();
     data_ = new_data;
     device_ = target_device;
 }
 
-Tensor Tensor::zeros(const std::vector<size_t>& shape, Device device) {
-    Tensor t(shape, device);
-    if (device == Device::CPU) {
-        std::memset(t.data_, 0, t.size_bytes());
+void Tensor::allocate(){
+    if(device_ == Device::CPU){
+        data_ = new float[numel_]; // numel_
     } else {
-        CHECK_CUDA(cudaMemset(t.data_, 0, t.size_bytes()));
+        size_t bytes = numel_ * sizeof(float);
+        CHECK_CUDA(cudaMalloc((void**)&data_, bytes), "cudaMalloc failed");
     }
-    return t;
 }
 
-Tensor Tensor::rand(const std::vector<size_t>& shape, Device device) {
-    // 先在 CPU 生成，如果需要 GPU 再转过去 (简单实现)
-    Tensor t(shape, Device::CPU);
-    float* ptr = static_cast<float*>(t.data_);
+void Tensor::free(){
+    // 修正 3: 安全性检查
+    // 如果 data_ 已经是空，直接返回，防止重复释放
+    if (data_ == nullptr) return;
+
+    if(device_ == Device::CPU){
+        delete[] data_; // date -> data_
+    } else {
+        CHECK_CUDA(cudaFree(data_), "cudaFree failed");
+    }
     
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_real_distribution<> dis(0.0, 1.0);
-
-    for (size_t i = 0; i < t.numel_; ++i) {
-        ptr[i] = static_cast<float>(dis(gen));
-    }
-
-    if (device == Device::CUDA) {
-        t.to(Device::CUDA);
-    }
-    return t;
+    // 修正 4: 必须置空悬空指针！
+    data_ = nullptr; 
 }
 
-void Tensor::print(size_t max_elements) const {
-    std::cout << "Tensor(shape=[";
-    for (size_t i = 0; i < shape_.size(); ++i) {
-        std::cout << shape_[i] << (i < shape_.size() - 1 ? ", " : "");
-    }
-    std::cout << "], device=" << (device_ == Device::CPU ? "CPU" : "CUDA") << ")\nData: ";
-
-    // 如果是 CUDA，先拷贝回 CPU 打印
-    if (device_ == Device::CUDA) {
-        // 创建一个临时 CPU tensor
-        // 这里为了简单，手动拷贝前几个元素
-        size_t count = std::min(numel_, max_elements);
-        std::vector<float> temp(count);
-        CHECK_CUDA(cudaMemcpy(temp.data(), data_, count * sizeof(float), cudaMemcpyDeviceToHost));
-        
-        for (size_t i = 0; i < count; ++i) {
-            std::cout << std::fixed << std::setprecision(4) << temp[i] << " ";
-        }
-    } else {
-        const float* ptr = static_cast<const float*>(data_);
-        for (size_t i = 0; i < std::min(numel_, max_elements); ++i) {
-            std::cout << std::fixed << std::setprecision(4) << ptr[i] << " ";
-        }
+void Tensor::print() const {
+    // 建议改进：如果是 GPU，自动拷回来打印，而不是报错
+    // 这里保留你的逻辑，但加上了必要的头文件引用
+    if (device_ != Device::CPU) {
+        // 如果想省事，可以在这里调用 const_cast<Tensor*>(this)->to(Device::CPU); 
+        // 但这样会改变原数据位置，不太好。
+        // 现在的报错也可以：
+        std::cerr << "Warning: Cannot print GPU tensor directly. Move to CPU first." << std::endl;
+        return;
     }
     
-    if (numel_ > max_elements) std::cout << "...";
-    std::cout << std::endl;
+    std::cout << "Tensor: [";
+    for (size_t i = 0; i < std::min(numel_, (size_t)10); ++i) { // 只打前10个防止刷屏
+        std::cout << data_[i] << " ";
+    }
+    if (numel_ > 10) std::cout << "...";
+    std::cout << "]" << std::endl;
 }

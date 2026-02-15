@@ -111,19 +111,23 @@ void Tensor::free(){
 }
 
 void Tensor::print() const {
-    // 建议改进：如果是 GPU，自动拷回来打印，而不是报错
-    // 这里保留你的逻辑，但加上了必要的头文件引用
-    if (device_ != Device::CPU) {
-        // 如果想省事，可以在这里调用 const_cast<Tensor*>(this)->to(Device::CPU); 
-        // 但这样会改变原数据位置，不太好。
-        // 现在的报错也可以：
-        std::cerr << "Warning: Cannot print GPU tensor directly. Move to CPU first." << std::endl;
-        return;
+    const float* print_ptr = nullptr;
+    std::vector<float> temp_buffer;
+
+    if (device_ == Device::CPU) {
+        print_ptr = static_cast<const float*>(data_);
+    } else {
+        // GPU case: Copy to temp buffer
+        temp_buffer.resize(numel_);
+        // 注意：这里的 CHECK_CUDA 宏可能需要根据定义调整参数个数
+        // 假设 CHECK_CUDA(call, msg)
+        CHECK_CUDA(cudaMemcpy(temp_buffer.data(), data_, numel_ * sizeof(float), cudaMemcpyDeviceToHost), "Print D2H copy");
+        print_ptr = temp_buffer.data();
     }
     
     std::cout << "Tensor: [";
     for (size_t i = 0; i < std::min(numel_, (size_t)10); ++i) { // 只打前10个防止刷屏
-        std::cout << data_[i] << " ";
+        std::cout << print_ptr[i] << " ";
     }
     if (numel_ > 10) std::cout << "...";
     std::cout << "]" << std::endl;

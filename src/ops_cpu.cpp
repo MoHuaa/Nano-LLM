@@ -1,10 +1,19 @@
 #include "ops.h"
 #include <cmath>
 #include <algorithm>
-#include <cstddef>
 #include <stdexcept>
 #include <iostream>
 #include <numeric>
+
+// 声明 CUDA Launch 函数 (定义在 ops_cuda.cu)
+void launch_rmsnorm(const Tensor& input, const Tensor& weight, Tensor& output, float epsilon);
+void launch_swiglu(const Tensor& gate, const Tensor& feat, Tensor& output);
+void launch_rope(const Tensor& input, const Tensor& pos, Tensor& output);
+
+#define REQUIRE_DEVICE_MATCH(t1, t2) \
+    if (t1.device() != t2.device()) { \
+        throw std::runtime_error("Device mismatch between tensors"); \
+    }
 
 #define REQUIRE_CPU(t) \
     if (t.device() != Device::CPU) { \
@@ -15,6 +24,7 @@
 namespace ops {
 
 void matmul(const Tensor& A, const Tensor& B, Tensor& C) {
+    // TODO: Add CUBLAS support later
     REQUIRE_CPU(A);
     REQUIRE_CPU(B);
     REQUIRE_CPU(C);
@@ -86,9 +96,14 @@ void softmax(Tensor& input) {
 }
 
 void rmsnorm(const Tensor& input, const Tensor& weight, Tensor& output, float epsilon) {
-    REQUIRE_CPU(input);
-    REQUIRE_CPU(weight);
-    REQUIRE_CPU(output);
+    REQUIRE_DEVICE_MATCH(input, weight);
+    REQUIRE_DEVICE_MATCH(input, output);
+
+    // Dispatch to CUDA if on GPU
+    if (input.device() == Device::CUDA) {
+        launch_rmsnorm(input, weight, output, epsilon);
+        return;
+    }
 
     const auto& shape = input.shape();
     size_t dim = shape.back();
@@ -120,9 +135,13 @@ void rmsnorm(const Tensor& input, const Tensor& weight, Tensor& output, float ep
 }
 
 void swiglu(const Tensor& gate, const Tensor& feat, Tensor& output) {
-    REQUIRE_CPU(gate);
-    REQUIRE_CPU(feat);
-    REQUIRE_CPU(output);
+    REQUIRE_DEVICE_MATCH(gate, feat);
+    REQUIRE_DEVICE_MATCH(gate, output);
+
+    if (gate.device() == Device::CUDA) {
+        launch_swiglu(gate, feat, output);
+        return;
+    }
 
     if (gate.numel() != feat.numel() || gate.numel() != output.numel()) {
         throw std::runtime_error("swiglu: Element size mismatch");
@@ -142,10 +161,13 @@ void swiglu(const Tensor& gate, const Tensor& feat, Tensor& output) {
 }
 
 void rope(const Tensor& input, const Tensor& pos, Tensor& output) {
-    // 1. 检查 CPU
-    REQUIRE_CPU(input);
-    REQUIRE_CPU(pos);
-    REQUIRE_CPU(output);
+    REQUIRE_DEVICE_MATCH(input, pos);
+    REQUIRE_DEVICE_MATCH(input, output);
+
+    if (input.device() == Device::CUDA) {
+        launch_rope(input, pos, output);
+        return;
+    }
 
     // 2. 假设 input 形状为 [batch, seq_len, head_dim]
     // 简化起见，我们将其视为 [rows, head_dim]，其中 rows = batch * seq_len
